@@ -1,0 +1,181 @@
+---
+- name: Setup and Configure Kubernetes Cluster
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update apt repository and cache
+      apt:
+        update_cache: yes
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        state: latest
+
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Remove swap from fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*([^#\s]\S*\s+)\s+(\S*\s+)\s+swap\s+'
+        replace: '# \1\2 swap'
+
+    - name: Check and free required ports
+      block:
+        - name: Check if port 6443 is available
+          shell: ss -tuln | grep :6443 || true
+          register: check_6443
+          failed_when: check_6443.rc == 0
+          ignore_errors: true
+
+        - name: Check if port 2379 is available
+          shell: ss -tuln | grep :2379 || true
+          register: check_2379
+          failed_when: check_2379.rc == 0
+          ignore_errors: true
+
+        - name: Check if port 2380 is available
+          shell: ss -tuln | grep :2380 || true
+          register: check_2380
+          failed_when: check_2380.rc == 0
+          ignore_errors: true
+
+        - name: Check if port 10250 is available
+          shell: ss -tuln | grep :10250 || true
+          register: check_10250
+          failed_when: check_10250.rc == 0
+          ignore_errors: true
+
+        - name: Check if port 10259 is available
+          shell: ss -tuln | grep :10259 || true
+          register: check_10259
+          failed_when: check_10259.rc == 0
+          ignore_errors: true
+
+        - name: Check if port 10257 is available
+          shell: ss -tuln | grep :10257 || true
+          register: check_10257
+          failed_when: check_10257.rc == 0
+          ignore_errors: true
+
+        - name: Fail if required ports are in use
+          fail:
+            msg: "Required port {{ item }} is in use."
+          with_items:
+            - "{{ check_6443.rc == 0 and '6443' or omit }}"
+            - "{{ check_2379.rc == 0 and '2379' or omit }}"
+            - "{{ check_2380.rc == 0 and '2380' or omit }}"
+            - "{{ check_10250.rc == 0 and '10250' or omit }}"
+            - "{{ check_10259.rc == 0 and '10259' or omit }}"
+            - "{{ check_10257.rc == 0 and '10257' or omit }}"
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+        state: present
+
+    - name: Add Kubernetes signing key
+      command: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      shell: echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Update apt repository and cache after adding Kubernetes repo
+      apt:
+        update_cache: yes
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold kubelet, kubeadm, kubectl at current version
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: held
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+
+    - name: Configure containerd
+      copy:
+        content: |
+          version = 2
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+            runtime_type = "io.containerd.runc.v2"
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+              SystemdCgroup = true
+        dest: /etc/containerd/config.toml
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Set sysctl parameters for Kubernetes
+      ansible.builtin.sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        state: present
+
+    - name: Apply sysctl params without reboot
+      command: sudo sysctl --system
+
+    - name: Install Helm
+      shell: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+- name: Initialize Kubernetes Cluster
+  hosts: master
+  become: yes
+  tasks:
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_output
+
+    - name: Create .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Copy admin.conf to user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+
+    - name: Add Cilium Helm repository
+      command: helm repo add cilium https://helm.cilium.io/
+
+    - name: Update Helm repositories
+      command: helm repo update
+
+    - name: Install Cilium using Helm
+      command: helm install cilium cilium/cilium --version 1.16.1 --namespace kube-system
+
+- name: Join Worker Nodes to Cluster
+  hosts: worker
+  become: yes
+  tasks:
+    - name: Join Kubernetes cluster
+      command: "{{ hostvars[groups['master'][0]]['kubeadm_output']['stdout_lines'] | select('search', 'kubeadm join') | list }}"
